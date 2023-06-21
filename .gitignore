@@ -11,3 +11,5 @@
 !/.vscode/c_cpp_properties.json
 
 /edk2/**/.*
+
+.DS_Store
