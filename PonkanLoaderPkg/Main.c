@@ -1,3 +1,4 @@
+#include <Guid/FileInfo.h>
 #include <Library/PrintLib.h>
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/UefiLib.h>
@@ -7,7 +8,6 @@
 #include <Protocol/SimpleFileSystem.h>
 #include <Uefi.h>
 
-// #@@range_begin(struct_memory_map)
 struct MemoryMap {
   UINTN buffer_size;
   VOID* buffer;
@@ -16,9 +16,7 @@ struct MemoryMap {
   UINTN descriptor_size;
   UINT32 descriptor_version;
 };
-// #@@range_end(struct_memory_map)
 
-// #@@range_begin(get_memory_map)
 EFI_STATUS
 GetMemoryMap(struct MemoryMap* map) {
   if (map->buffer == NULL) {
@@ -32,9 +30,7 @@ GetMemoryMap(struct MemoryMap* map) {
   return gBS->GetMemoryMap(&map->map_size, (EFI_MEMORY_DESCRIPTOR*)map->buffer, &map->map_key,
                            &map->descriptor_size, &map->descriptor_version);
 }
-// #@@range_end(get_memory_map)
 
-// #@@range_begin(get_memory_type)
 const CHAR16* GetMemoryTypeUnicode(EFI_MEMORY_TYPE type) {
   switch (type) {
     case EfiReservedMemoryType:
@@ -73,9 +69,7 @@ const CHAR16* GetMemoryTypeUnicode(EFI_MEMORY_TYPE type) {
       return L"InvalidMemoryType";
   }
 }
-// #@@range_end(get_memory_type)
 
-// #@@range_begin(save_memory_map)
 // 引数で与えられたメモリマップの情報をCSV形式でファイルに書き出す
 EFI_STATUS SaveMemoryMap(struct MemoryMap* map, EFI_FILE_PROTOCOL* file) {
   CHAR8 buf[256];
@@ -100,7 +94,6 @@ EFI_STATUS SaveMemoryMap(struct MemoryMap* map, EFI_FILE_PROTOCOL* file) {
   }
   return EFI_SUCCESS;
 }
-// #@@range_end(save_memory_map)
 
 EFI_STATUS OpenRootDir(EFI_HANDLE image_handle, EFI_FILE_PROTOCOL** root) {
   EFI_LOADED_IMAGE_PROTOCOL* loaded_image;
@@ -118,7 +111,6 @@ EFI_STATUS OpenRootDir(EFI_HANDLE image_handle, EFI_FILE_PROTOCOL** root) {
 
 EFI_STATUS EFIAPI UefiMain(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE* system_table) {
   Print(L"Hello, Ponkan World!\n");
-  // #@@range_begin(main)
   CHAR8 memmap_buf[4096 * 4];
   struct MemoryMap memmap = {sizeof(memmap_buf), memmap_buf, 0, 0, 0, 0};
   GetMemoryMap(&memmap);
@@ -131,7 +123,65 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE* system_tab
                  EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
   SaveMemoryMap(&memmap, memmap_file);
   memmap_file->Close(memmap_file);
-  // #@@range_end(main)
+
+  // #@@range_start(read_kernel)
+  EFI_FILE_PROTOCOL* kernel_file;
+  root_dir->Open(root_dir, &kernel_file, L"\\kernel.elf", EFI_FILE_MODE_READ, 0);
+
+  // kernel.elf全体を読み込むためのメモリを確保
+  // sizeof(CHAR16) * 12: "\kernel_elf"の12文字(ヌル文字含む)を格納するためのメモリサイズ
+  UINTN file_info_size = sizeof(EFI_FILE_INFO) + sizeof(CHAR16) * 12;
+  UINT8 file_info_buffer[file_info_size];
+  kernel_file->GetInfo(kernel_file, &gEfiFileInfoGuid, &file_info_size, file_info_buffer);
+
+  // ポインタのキャスををして,FileSizeを読み取る
+  EFI_FILE_INFO* file_info = (EFI_FILE_INFO*)file_info_buffer;
+  UINTN kernel_file_size = file_info->FileSize;
+
+  // カーネルは0x100000番地に配置して動作される前提で作っている(ld.lldのオプションで指定)
+  EFI_PHYSICAL_ADDRESS kernel_base_addr = 0x100000;
+
+  // args: メモリ確保の仕方, 確保されるメモリ領域の種別, 大きさ, 確保したメモリ量気を書き込む変数
+  gBS->AllocatePages(AllocateAddress, EfiLoaderData, (kernel_file_size + 0xfff) / 0x1000,
+                     &kernel_base_addr);
+  kernel_file->Read(kernel_file, &kernel_file_size, (VOID*)kernel_base_addr);
+  Print(L"Kernel: 0x%0lx (%lu bytes)\n", kernel_base_addr, kernel_file_size);
+  // #@@range_end(read_kernel)
+
+  // #@@range_start(exit_bs)
+  EFI_STATUS status;
+  // ブートサービスを停止する.成功したらこれ以降はブートサービスの機能が使えなくなる
+  status = gBS->ExitBootServices(image_handle, memmap.map_key);
+  if (EFI_ERROR(status)) {
+    status = GetMemoryMap(&memmap);
+    if (EFI_ERROR(status)) {
+      Print(L"filed to get memory map: %r\n", status);
+      while (1)
+        ;
+    }
+    status = gBS->ExitBootServices(image_handle, memmap.map_key);
+    // 再度失敗したらエラーメッセージ出して停止する(重大なエラーだろうから)
+    if (EFI_ERROR(status)) {
+      Print(L"Could not exit boot service: %r\n", status);
+      while (1)
+        ;
+    }
+  }
+  // #@@range_end(exit_bs)
+
+  // #@@range_start(call_kernel)
+  // 読み込んだカーネルを起動する
+  // エントリポイント(kernel/main.cppのKernelMain())を呼び出す.
+  // ELFファイルのヘッダを調べるとエントリポイントが書いてある
+  UINT64 entry_addr = *(UINT64*)(kernel_base_addr + 24);
+
+  // 引数と戻り値がどっちもvoidな関数を表す型
+  typedef void EntryPointType(void);
+  // entory_addrを関数ポインタにキャストして呼び出す.
+  // KernelMain()が関数だから,そのアドレスをさすポインタってこと
+  EntryPointType* entry_point = (EntryPointType*)entry_addr;
+  entry_point();
+  // #@@range_end(call_kernel)
 
   Print(L"All done\n");
 
